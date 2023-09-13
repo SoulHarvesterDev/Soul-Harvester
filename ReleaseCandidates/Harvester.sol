@@ -27,17 +27,18 @@ contract Harvester is Ownable, Pausable, ReentrancyGuard {
         uint256 alreadyReceivedToken;
         uint256 limit;
         uint256 available;
-        uint256 harvestingEfficiency;
-        uint256 dimishingFactor;
+        uint256 lastBurned;
+        uint256 sharePerSecond;
+        uint256 lastBurnedTimeElapsed;
     }
     mapping(address => collection) public collectionInformation;
 
     //
     address[] public whitelistedContracts;
-    address public burnAddress;
-    address public gaugeAddress;
+    address public burnAddress = 0x000000000000000000000000000000000000dEaD;
+    address public vesselAddress;
     address public teamAddress;
-    uint256 public portion;
+    uint256 public recyclingFee;
     uint256 public distribution_Team;
     uint256 public distribution_Incentive;
     uint256 public distribution_manual_Incentive;
@@ -49,70 +50,73 @@ contract Harvester is Ownable, Pausable, ReentrancyGuard {
 
     constructor(
         IERC20 _token, 
-        address _burnaddress, 
-        address _gaugeAddress, 
+        address _vesselAddress, 
         address _teamAddress, 
-        uint256 _portion, 
-        uint256 _distribution_Incentive, 
-        uint256 _distribution_Team, 
-        uint256 _distribution_manual_Incentive,
-        address _ogNFTAddress,
-        uint256 _distribution_bonus_OG 
+        address _ogNFTAddress
+
         ) {
         token = _token;
-        burnAddress = _burnaddress;
-        gaugeAddress = _gaugeAddress;
+        vesselAddress = _vesselAddress;
         teamAddress = _teamAddress;
-        portion = _portion;                                             // value/100000 * remaining Token
-        distribution_Incentive = _distribution_Incentive;               // value/100000 * portion
-        distribution_Team = _distribution_Team;                         // value/100000 * portion
+        ogNFTAddress = _ogNFTAddress;        
+        
+        distribution_Incentive = 17000;               
+        distribution_Team = 8000;                         
+        distribution_manual_Incentive = 3000;   // value/100000 * remaining Token
+        distribution_bonus_OG = 110000;                 
 
-        distribution_manual_Incentive = _distribution_manual_Incentive; // value/100000 * remaining Token
-        ogNFTAddress = _ogNFTAddress;
-        distribution_bonus_OG = _distribution_bonus_OG;                 // value/100000 * portion
+        recyclingFee = 0.001 ether;        //input in wei 
 
         // token = IERC20(address(0xc0C16B8e166D2b576f1cDA822aE24E2e8d06B49f));
-        // burnAddress = 0x000000000000000000000000000000000000dEaD;
-        // gaugeAddress = 0xd75CD7323FDA26F23361250E7e9A558C14E89d84;
+        // vesselAddress = 0xd75CD7323FDA26F23361250E7e9A558C14E89d84;
         // teamAddress = 0x87fC83A1607AC6F0F26F247D786698ed27EBCb5b;
         // ogNFTAddress = 0x0fE3552D5073A92A9021003042900aFaD3490bd9;
 
-        // portion = 10;                            // value/100000 * remaining Token
-        // distribution_Incentive = 17000;          // value/100000 * portion
-        // distribution_Team = 8000;                // value/100000 * portion
+        // distribution_Incentive = 17000;          
+        // distribution_Team = 8000;                
 
         // distribution_manual_Incentive = 3000;    // value/100000 * remaining Token
-        // distribution_bonus_OG = 110000;          // value/100000 * portion
-
-
+        // distribution_bonus_OG = 110000;          
+        // recyclingFee = 1000000000000000;         // 0.001 Eth = 1000000000000000 wei
+        
+        manager = msg.sender;
     }
 
-    function burnMultipleNFTs(address _nftContract, uint256[] memory _tokenIds) public nonReentrant whenNotPaused {
+    function burnMultipleNFTs(address _nftContract, uint256[] memory _tokenIds) public payable nonReentrant whenNotPaused {
         uint256 initialAmount = token.balanceOf(address(this));
+        uint256 timeElapsed = block.timestamp - collectionInformation[_nftContract].lastBurned;
+        require(timeElapsed > 60, "Last burn happened recently! Wait 60s to be able to burn another NFT!");
         require(initialAmount > 0, "Remaining amount must be greater than zero");
         require(_tokenIds.length > 0, "At least one NFT token ID must be specified");
         require(collectionInformation[_nftContract].isWhitelisted, "NFT contract is not whitelisted");
         require(collectionInformation[_nftContract].available >= _tokenIds.length, "This burn would exccess the limit!");
-        require(collectionInformation[_nftContract].harvestingEfficiency > 0,"Already too many NFTs of this collection were burned!");
         for (uint256 i = 0; i < _tokenIds.length; i++) {
             require(IERC721(_nftContract).ownerOf(_tokenIds[i]) == msg.sender, "Caller is not the owner of the NFT");
         }
-        uint256 localPortion = portion;
+        require(msg.value >= recyclingFee * _tokenIds.length, "Insufficient Eth value");
+
+        // 0.01% / 3 days => 0,00000003858024691 %/s => 0,000000000386 share/s * 1000000000000 => 386 => 386 * 1000000 (for decimals) = 386000000
+        // portion = time[s] * 386000000 / 10000000
+        collectionInformation[_nftContract].lastBurnedTimeElapsed = timeElapsed;
+        uint256 localPortion = collectionInformation[_nftContract].sharePerSecond * timeElapsed / 10000000;
+
+
         uint256 incentiveAmount;
         uint256 incentiveReceived;
         uint256 teamAmount;
         uint256 teamReceived;
         uint256 tokenReceived;
+        uint256 dimishing = 90;     // 10% reduction for each additional NFT burned at once     
         
-        if(IERC721(ogNFTAddress).balanceOf(msg.sender) > 0){localPortion = portion * distribution_bonus_OG / 100000;}
+        if(IERC721(ogNFTAddress).balanceOf(msg.sender) > 0){localPortion = localPortion * distribution_bonus_OG / 100000;}
+
+        payable(teamAddress).transfer(recyclingFee * _tokenIds.length);
 
         for (uint256 i = 0; i < _tokenIds.length; i++) {
             // Transfer the NFT to the burn address
             IERC721(_nftContract).transferFrom(msg.sender, burnAddress, _tokenIds[i]);
 
-            uint256 amount = initialAmount * localPortion / 100000;
-
-            amount = amount * collectionInformation[_nftContract].harvestingEfficiency / 100000;
+            uint256 amount = initialAmount * localPortion / 100000000000;
 
             incentiveAmount = amount * distribution_Incentive / 100000;
             teamAmount = amount * distribution_Team / 100000;
@@ -122,13 +126,16 @@ contract Harvester is Ownable, Pausable, ReentrancyGuard {
             tokenReceived += amount - incentiveAmount - teamAmount;
 
             initialAmount -= amount;
+
+            initialAmount = initialAmount * dimishing / 100;
+
             collectionInformation[_nftContract].alreadyBurned++;
-            collectionInformation[_nftContract].harvestingEfficiency = collectionInformation[_nftContract].harvestingEfficiency * collectionInformation[_nftContract].dimishingFactor / 100000;
+            userInformation[msg.sender].allTimeBurnedNFT++;
         }
 
             // Distribute tokens to the caller, team and Gauge address
             token.safeTransfer(msg.sender, tokenReceived);
-            token.safeTransfer(gaugeAddress, incentiveReceived);
+            token.safeTransfer(vesselAddress, incentiveReceived);
             token.safeTransfer(teamAddress, teamReceived);
 
             //update user information
@@ -137,33 +144,37 @@ contract Harvester is Ownable, Pausable, ReentrancyGuard {
             //update collection information
             collectionInformation[_nftContract].alreadyReceivedToken += tokenReceived;
             collectionInformation[_nftContract].available = collectionInformation[_nftContract].limit - collectionInformation[_nftContract].alreadyBurned;
+            collectionInformation[_nftContract].lastBurned = block.timestamp;
+
             emit NFTsBurned(_nftContract, _tokenIds, msg.sender, tokenReceived);
 
     }    
 
     function getEstimatedAmount(address _nftContract, uint256 _selectedNFTs, address _userWallet) public view returns (uint256 _estimation){
-        uint256 efficiency = collectionInformation[_nftContract].harvestingEfficiency;
-
-        require(efficiency > 0,"Already too many NFTs of this collection were burned!");
         require(collectionInformation[_nftContract].available >= _selectedNFTs, "This burn would exccess the limit!");
 
         uint256 initialAmount = token.balanceOf(address(this));
-        uint256 localPortion = portion;
+
+        // 0.01% / 1 days => 0,00000003858024691 %/s => 0,0000000001157 share/s * 1000000000000 => 1157 => 1157 * 1000000 (for decimals) = 1157000000
+        // portion = time[s] * 1157000000 / 10000000
+
+        uint256 timeElapsed = block.timestamp - collectionInformation[_nftContract].lastBurned;
+        uint256 localPortion = collectionInformation[_nftContract].sharePerSecond * timeElapsed / 10000000;
+
+
         uint256 incentiveAmount;
         uint256 incentiveReceived;
         uint256 teamAmount;
         uint256 teamReceived;
         uint256 tokenReceived;
         uint256 alreadyBurned = collectionInformation[_nftContract].alreadyBurned;
-        uint256 dimishing = collectionInformation[_nftContract].dimishingFactor;
+        uint256 dimishing = 90;  
 
-        if(IERC721(ogNFTAddress).balanceOf(_userWallet) > 0){localPortion = portion * distribution_bonus_OG / 100000;}
+        if(IERC721(ogNFTAddress).balanceOf(_userWallet) > 0){localPortion = localPortion * distribution_bonus_OG / 100000;}
 
         for (uint256 i = 0; i < _selectedNFTs; i++) {
 
-            uint256 amount = initialAmount * localPortion / 100000;
-
-            amount = amount * efficiency / 100000;
+            uint256 amount = initialAmount * localPortion / 100000000000;
 
             incentiveAmount = amount * distribution_Incentive / 100000;
             teamAmount = amount * distribution_Team / 100000;
@@ -173,29 +184,25 @@ contract Harvester is Ownable, Pausable, ReentrancyGuard {
             tokenReceived += amount - incentiveAmount - teamAmount;
 
             initialAmount -= amount;
-            alreadyBurned++;
-            efficiency = efficiency * dimishing / 100000;
 
+            initialAmount = initialAmount * dimishing / 100;
+
+            alreadyBurned++;
         }
      
         return tokenReceived;
     }
  
-    function addToWhitelist(address _nftContract, uint256 _limit, uint256 _harvestingEfficiency, uint256 _dimishingFactor) public onlyOwnerOrManager {
+    function addToWhitelist(address _nftContract) public onlyOwnerOrManager {
         require(!collectionInformation[_nftContract].isWhitelisted, "NFT contract is already whitelisted");
 
         collectionInformation[_nftContract].isWhitelisted = true;
-        collectionInformation[_nftContract].limit = _limit;
+        collectionInformation[_nftContract].limit = 1000;
         collectionInformation[_nftContract].available = collectionInformation[_nftContract].limit - collectionInformation[_nftContract].alreadyBurned;
-        collectionInformation[_nftContract].harvestingEfficiency = _harvestingEfficiency;
-        collectionInformation[_nftContract].dimishingFactor = _dimishingFactor;
+        collectionInformation[_nftContract].lastBurned = block.timestamp;
+        collectionInformation[_nftContract].sharePerSecond = 1157000000; // ~0.01% / day
 
         whitelistedContracts.push(_nftContract);
-
-        // Defaults
-        // _limit = 1000
-        // _harvestingEfficiency = 100000
-        // _dimishingFactor = 99500
 
     }
     function getWhitelist() public view returns (address[] memory _whitelistedContracts){
@@ -208,6 +215,14 @@ contract Harvester is Ownable, Pausable, ReentrancyGuard {
         require(_limit >= collectionInformation[_nftContract].alreadyBurned, "Limit would be less than NFTs alread been burned!");
         
         collectionInformation[_nftContract].limit = _limit;
+    }
+
+    function changeShare(address _nftContract, uint256 _share) public onlyOwnerOrManager {
+        require(collectionInformation[_nftContract].isWhitelisted, "NFT contract is not whitelisted");
+        require(_share > 0, "Share cannot be zero!");
+        
+        collectionInformation[_nftContract].sharePerSecond = _share; // default = 1157000000 => ~0.01% / day
+        collectionInformation[_nftContract].lastBurned = block.timestamp; 
     }
 
     function removeFromWhitelist(address _nftContract) public onlyOwnerOrManager {
@@ -227,8 +242,8 @@ contract Harvester is Ownable, Pausable, ReentrancyGuard {
         whitelistedContracts.pop();
     }
 
-    function setGaugeAddress(address _gaugeAddress) public onlyOwner {
-        gaugeAddress = _gaugeAddress;
+    function setVesselAddress(address _vesselAddress) public onlyOwner {
+        vesselAddress = _vesselAddress;
     }
     
     function setTeamAddress(address _teamAddress) public onlyOwner {
@@ -239,10 +254,6 @@ contract Harvester is Ownable, Pausable, ReentrancyGuard {
         token = IERC20(_tokenAddress);
     }
 
-    function setPortion(uint256 _portion) public onlyOwner {
-        portion = _portion;
-    }
-    
     function setOGNFTAddress(address _ogNFTAddress) public onlyOwner {
         ogNFTAddress = _ogNFTAddress;
     }
@@ -258,12 +269,6 @@ contract Harvester is Ownable, Pausable, ReentrancyGuard {
     function setManualIncentivePortion(uint256 _manualIncentivePortion) public onlyOwner {
         distribution_manual_Incentive = _manualIncentivePortion;
     }
-    
-    function setDimishingFactor(address _nftContract, uint256 _dimishingFactor) public onlyOwner {
-        require(collectionInformation[_nftContract].isWhitelisted, "NFT contract is not whitelisted");
-
-        collectionInformation[_nftContract].dimishingFactor = _dimishingFactor;
-    }
 
     function sendRemainingTokens() public onlyOwner {
         uint256 remainingTokens = token.balanceOf(address(this));
@@ -275,7 +280,7 @@ contract Harvester is Ownable, Pausable, ReentrancyGuard {
         require(remainingToken > 0, "Remaining amount must be greater than zero");
 
         uint256 tokenForManualIncentive = remainingToken * distribution_manual_Incentive / 100000;
-        token.safeTransfer(gaugeAddress, tokenForManualIncentive);
+        token.safeTransfer(vesselAddress, tokenForManualIncentive);
     }
 
     function transferOwnership(address _newOwner) public override onlyOwner {
@@ -296,7 +301,10 @@ contract Harvester is Ownable, Pausable, ReentrancyGuard {
         _;
     }    
     
-    function changeManager(address newManager) public onlyOwner {
-        manager = newManager;
+    function changeManager(address _newManager) public onlyOwner {
+        manager = _newManager;
     }    
+    function setRecyclingFee(uint256 _newFee) public onlyOwner {
+        recyclingFee = _newFee;
+    }
 }
