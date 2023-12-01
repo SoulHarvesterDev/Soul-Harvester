@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.22;
 
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -7,13 +7,17 @@ import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "/Contracts/SoulStone/ISoulStone.sol";
+import "/Contracts/ReleaseCandidates/ISkirmish.sol";
 
-contract Skirmish is Ownable, Pausable, ReentrancyGuard {
+contract Skirmish is Ownable(msg.sender), Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     address public manager;
 
     IERC20 public token;
+    ISoulStone public SoulStone;
+    ISkirmish public oldSkirmish;
 
     uint256 public totalVotes;
     uint256 public distribution_Vessel;
@@ -25,9 +29,11 @@ contract Skirmish is Ownable, Pausable, ReentrancyGuard {
     address public teamAddress;
     address public vesselAddress;
     address public ogNFTAddress;
+    address public soulStoneAddress;
     
     bool public votingActive;
     bool public resetted;
+    bool public migrated;
 
     mapping(address => uint256) public votes;
 
@@ -62,18 +68,17 @@ contract Skirmish is Ownable, Pausable, ReentrancyGuard {
         IERC20 _token, 
         address _vesselAddress, 
         address _teamAddress, 
-        address _ogNFTAddress 
+        address _soulStoneAddress 
         ) {
         token = _token;
+        soulStoneAddress = _soulStoneAddress;  
 
         distribution_Vessel = 50000;    // value/100000
         distribution_Team = 30000;      // value/100000
-        ogNFTAddress = _ogNFTAddress;               
         voting_bonus_OG = 110000;         // value/100000
 
         // distribution_Vessel = 50000;          // value/100000 (e.g. 50000/100000 = 50.000%)
         // distribution_Team = 30000;           // value/100000 (e.g. 30000/100000 = 30.000%)
-        // ogNFTAddress = 0x0fE3552D5073A92A9021003042900aFaD3490bd9;
         // voting_bonus_OG = 110000;            // value/100000 (e.g. 110000/100000 = 110.000%)
 
         teamAddress = _teamAddress;
@@ -83,19 +88,22 @@ contract Skirmish is Ownable, Pausable, ReentrancyGuard {
         votingActive = false;
 
         manager = msg.sender;
-
+        SoulStone = ISoulStone(soulStoneAddress);
+        oldSkirmish = ISkirmish(0xC86d739474C9c45007f41c99FE650FBc4372887a);
     } 
 
-    function startVoting() public onlyOwnerOrManager {
+    function startVoting(uint256 daysActive ) public onlyOwnerOrManager {
         require(listOfNominees.length >= 2, "At least 2 Nominees have to be listed!");
         require(resetted, "List of nominees has to get resetted first!");
+        require(daysActive > 0, "Duration has to be greater than 0!");
 
-        voteFinishTime = block.timestamp + 7 days;
+        voteFinishTime = block.timestamp + (daysActive * 1 days);
         totalVotes = 0;
 
         resetted = false;
         votingActive = true;
     }
+
     function finishVoting() public onlyOwnerOrManager {
         require(votingActive, "Voting is not live yet!");
         require(block.timestamp >= voteFinishTime, "Voting still running!");
@@ -142,6 +150,7 @@ contract Skirmish is Ownable, Pausable, ReentrancyGuard {
         votingActive = false;
         resetted = true;
     }
+
     function manuallyEndSeason() public onlyOwnerOrManager {
         require(block.timestamp <= voteFinishTime, "Voting has already ended!");
         voteFinishTime = block.timestamp;
@@ -156,7 +165,10 @@ contract Skirmish is Ownable, Pausable, ReentrancyGuard {
         
         uint256 votingPower = amount;
 
-        if(IERC721(ogNFTAddress).balanceOf(msg.sender) > 0){votingPower = votingPower * voting_bonus_OG / 100000;}
+        if(SoulStone.hasSoulStone(msg.sender)){
+            uint256 bonus = SoulStone.getBonusValueSkirmish(msg.sender);
+            votingPower = votingPower * (100 + bonus) / 100;
+        }
 
         votes[msg.sender] += votingPower;
         totalVotes += votingPower;
@@ -177,6 +189,19 @@ contract Skirmish is Ownable, Pausable, ReentrancyGuard {
         emit VotesApplied(msg.sender, votingPower, nominee);
     }
 
+    function getEstimatedVotingPower(address wallet, uint256 amount) public view returns(uint256[2] memory){
+        
+        uint256 votingPower = amount;
+        uint256 bonus = 0;
+
+        if(SoulStone.hasSoulStone(wallet)){
+            bonus = SoulStone.getBonusValueSkirmish(wallet);
+            votingPower = votingPower *  (100 + bonus) / 100;
+        }        
+
+        return [votingPower, bonus];
+    }
+
     function addNominee(address nominee) public onlyOwnerOrManager {
         require(!votingActive, "Voting is already active!");
         require(resetted, "Data from last season are not yet resetted!");
@@ -189,20 +214,48 @@ contract Skirmish is Ownable, Pausable, ReentrancyGuard {
         listOfNominees.push(nominee);
     }
 
-    function getNominees() public view returns (address[] memory _nominees){
+    function getNominees() public view returns (address[] memory){
         require(listOfNominees.length >= 1, "At least 2 Nominees have to be listed!");
         require(votingActive, "Voting is not live yet!");
 
         return listOfNominees;
     }
-    function getSeasonHistory() public view returns (historyValues[] memory _history){
-        require(seasonHistory.length >= 1, "At least one season has to be concluded!");
-       
+
+    function getSeasonHistory() public view returns (historyValues[] memory){
         return seasonHistory;
     }
-    function getSeasonVoter() public view returns (activeVoter[] memory _seasonVoter){
+
+    function getSeasonHistory(uint256 _index) public view returns (uint256, address, uint256, uint256, uint256){
+        require(seasonHistory.length >= 1, "At least one season has to be concluded!");
+
+        historyValues memory temp = seasonHistory[_index];
+
+        return (temp.season, temp.winner, temp.totalSeasonVotes, temp.voterCount, temp.winnerShare);
+    }
+
+    function updateSeasonHistory(uint256 _season, address _winner, uint256 _amount, uint256 _voter, uint256 _share) public onlyOwner (){
+        
+        seasonHistory.push(historyValues(_season,_winner,_amount,_voter,_share));
+        collectionInformation[_winner].hasWon = true;
+        season++;
+    }
+
+    function migrateOldData() public onlyOwner (){
+        require(!migrated,"Migration already happened!");
+        season = oldSkirmish.season();
+
+        for (uint256 i=0; i < season; i++) 
+        {
+            (uint256 _season, address _winner, uint256 _amount, uint256 _voter, uint256 _share) = oldSkirmish.getSeasonHistory(i);
+
+            seasonHistory.push(historyValues(_season,_winner,_amount,_voter,_share));
+            collectionInformation[_winner].hasWon = true;
+        }        
+        migrated = true;
+    }
+
+    function getSeasonVoter() public view returns (activeVoter[] memory){
         require(votingActive, "Voting is not live yet!");
-        require(voter.length >= 1, "At least someone should vote first!");
        
         return voter;
     }
@@ -236,12 +289,9 @@ contract Skirmish is Ownable, Pausable, ReentrancyGuard {
         distribution_Vessel = _vesselPortion;     // value / 100000
     }
 
-    function setOGNFTAddress(address _ogNFTAddress) public onlyOwner {
-        ogNFTAddress = _ogNFTAddress;
-    }
-    
-    function setOGBonus(uint256 _bonus_OG) public onlyOwner {
-        voting_bonus_OG = _bonus_OG;            // value / 100000
+    function setSoulStoneAddress(address _soulStoneAddress) public onlyOwner {
+        soulStoneAddress = _soulStoneAddress;
+        SoulStone = ISoulStone(soulStoneAddress);
     }
 
     function sendRemainingTokens() public onlyOwner {
@@ -269,4 +319,5 @@ contract Skirmish is Ownable, Pausable, ReentrancyGuard {
     function changeManager(address newManager) public onlyOwner {
     manager = newManager;
     }
+    
     }

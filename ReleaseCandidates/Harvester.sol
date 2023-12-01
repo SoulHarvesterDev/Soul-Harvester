@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.22;
 
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
@@ -8,67 +8,53 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "/Contracts/SoulStone/ISoulStone.sol";
+import "/Contracts/ReleaseCandidates/IDataCollection.sol";
 
-contract Harvester is Ownable, Pausable, ReentrancyGuard {
+contract Harvester is Ownable(msg.sender), Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
     IERC20 public token;
+    ISoulStone public SoulStone;
+    IDataCollection public extCollectionInformation;
 
     address public manager;
 
-    struct user{
-        uint256  allTimeReceived;
-        uint256  allTimeBurnedNFT;
-    }    
-    mapping(address => user) public userInformation;
-
-    struct collection{
-        bool isWhitelisted;
-        uint256 alreadyBurned;
-        uint256 alreadyReceivedToken;
-        uint256 limit;
-        uint256 available;
-        uint256 lastBurned;
-        uint256 sharePerSecond;
-        uint256 lastBurnedTimeElapsed;
-    }
-    mapping(address => collection) public collectionInformation;
-
-    //
-    address[] public whitelistedContracts;
     address public burnAddress = 0x000000000000000000000000000000000000dEaD;
+    address public soulStoneAddress;
     address public vesselAddress;
     address public teamAddress;
     uint256 public recyclingFee;
     uint256 public distribution_Team;
     uint256 public distribution_Incentive;
     uint256 public distribution_manual_Incentive;
-    uint256 public distribution_bonus_OG;
+    uint256 public baseSharePerSecond;
 
-    address public ogNFTAddress;
-			
+   //-----Events-----
+	//Harvest		
     event NFTsBurned(address indexed nftContract, uint256[] tokenIds, address indexed sender, uint256 amount);
 
     constructor(
         IERC20 _token, 
         address _vesselAddress, 
         address _teamAddress, 
-        address _ogNFTAddress
+        address _soulStoneAddress
 
         ) {
         token = _token;
         vesselAddress = _vesselAddress;
         teamAddress = _teamAddress;
-        ogNFTAddress = _ogNFTAddress;        
-        
-        distribution_Incentive = 17000;               
-        distribution_Team = 8000;                         
+        soulStoneAddress = _soulStoneAddress;  
+
+
+        //default Values
+        distribution_Incentive = 17000;         // the amount that goes to the vessel         
+        distribution_Team = 8000;               // the amount the team gets with every burn         
         distribution_manual_Incentive = 3000;   // value/100000 * remaining Token
-        distribution_bonus_OG = 110000;                 
+        recyclingFee = 0.001 ether;             // input in wei
+        baseSharePerSecond = 0;                 // increase rewardRate for Promo 
 
-        recyclingFee = 0.001 ether;        //input in wei 
-
-        // token = IERC20(address(0xc0C16B8e166D2b576f1cDA822aE24E2e8d06B49f));
-        // vesselAddress = 0xd75CD7323FDA26F23361250E7e9A558C14E89d84;
+        // token = IERC20(address(0x297Ede2Be2D2471cf9834fC1C1d616aCae867443));
+        // vesselAddress = 0xf5E43216eaCd5BFCa0239491b86F5081758A8a36;
         // teamAddress = 0x87fC83A1607AC6F0F26F247D786698ed27EBCb5b;
         // ogNFTAddress = 0x0fE3552D5073A92A9021003042900aFaD3490bd9;
 
@@ -76,20 +62,23 @@ contract Harvester is Ownable, Pausable, ReentrancyGuard {
         // distribution_Team = 8000;                
 
         // distribution_manual_Incentive = 3000;    // value/100000 * remaining Token
-        // distribution_bonus_OG = 110000;          
         // recyclingFee = 1000000000000000;         // 0.001 Eth = 1000000000000000 wei
         
         manager = msg.sender;
+        SoulStone = ISoulStone(soulStoneAddress);
+        extCollectionInformation = IDataCollection(0xe21164931AAa35EDB19D7DfcF93aa059C65132FE);
     }
-
+    /**
+     * @dev burn one or multiple NFTs at once
+    */
     function burnMultipleNFTs(address _nftContract, uint256[] memory _tokenIds) public payable nonReentrant whenNotPaused {
         uint256 initialAmount = token.balanceOf(address(this));
-        uint256 timeElapsed = block.timestamp - collectionInformation[_nftContract].lastBurned;
+        uint256 timeElapsed = block.timestamp - extCollectionInformation.getLastBurned(_nftContract);
         require(timeElapsed > 60, "Last burn happened recently! Wait 60s to be able to burn another NFT!");
         require(initialAmount > 0, "Remaining amount must be greater than zero");
         require(_tokenIds.length > 0, "At least one NFT token ID must be specified");
-        require(collectionInformation[_nftContract].isWhitelisted, "NFT contract is not whitelisted");
-        require(collectionInformation[_nftContract].available >= _tokenIds.length, "This burn would exccess the limit!");
+        require(extCollectionInformation.isWhitelisted(_nftContract), "NFT contract is not whitelisted");
+        require(extCollectionInformation.getAvailable(_nftContract) >= _tokenIds.length, "This burn would exccess the limit!");
         for (uint256 i = 0; i < _tokenIds.length; i++) {
             require(IERC721(_nftContract).ownerOf(_tokenIds[i]) == msg.sender, "Caller is not the owner of the NFT");
         }
@@ -97,9 +86,7 @@ contract Harvester is Ownable, Pausable, ReentrancyGuard {
 
         // 0.01% / 3 days => 0,00000003858024691 %/s => 0,000000000386 share/s * 1000000000000 => 386 => 386 * 1000000 (for decimals) = 386000000
         // portion = time[s] * 386000000 / 10000000
-        collectionInformation[_nftContract].lastBurnedTimeElapsed = timeElapsed;
-        uint256 localPortion = collectionInformation[_nftContract].sharePerSecond * timeElapsed / 10000000;
-
+        uint256 localPortion = (extCollectionInformation.getShare(_nftContract) + baseSharePerSecond) * timeElapsed / 10000000;
 
         uint256 incentiveAmount;
         uint256 incentiveReceived;
@@ -108,7 +95,11 @@ contract Harvester is Ownable, Pausable, ReentrancyGuard {
         uint256 tokenReceived;
         uint256 dimishing = 90;     // 10% reduction for each additional NFT burned at once     
         
-        if(IERC721(ogNFTAddress).balanceOf(msg.sender) > 0){localPortion = localPortion * distribution_bonus_OG / 100000;}
+        if(SoulStone.hasSoulStone(msg.sender)){
+            uint256 bonus =  SoulStone.getBonusValueHarvest(msg.sender);
+                localPortion = localPortion * (100 + bonus) / 100;
+        }
+        else{SoulStone.mintNext(msg.sender);}
 
         payable(teamAddress).transfer(recyclingFee * _tokenIds.length);
 
@@ -129,37 +120,35 @@ contract Harvester is Ownable, Pausable, ReentrancyGuard {
 
             initialAmount = initialAmount * dimishing / 100;
 
-            collectionInformation[_nftContract].alreadyBurned++;
-            userInformation[msg.sender].allTimeBurnedNFT++;
         }
 
-            // Distribute tokens to the caller, team and Gauge address
+            // Distribute tokens to the caller, team and vessel address
             token.safeTransfer(msg.sender, tokenReceived);
             token.safeTransfer(vesselAddress, incentiveReceived);
             token.safeTransfer(teamAddress, teamReceived);
 
             //update user information
-            userInformation[msg.sender].allTimeReceived += tokenReceived;
+            extCollectionInformation.updateUserValues(msg.sender,tokenReceived,_tokenIds.length);
             
             //update collection information
-            collectionInformation[_nftContract].alreadyReceivedToken += tokenReceived;
-            collectionInformation[_nftContract].available = collectionInformation[_nftContract].limit - collectionInformation[_nftContract].alreadyBurned;
-            collectionInformation[_nftContract].lastBurned = block.timestamp;
+            extCollectionInformation.updateCollectionInformation(_nftContract,timeElapsed,_tokenIds.length,tokenReceived);
 
             emit NFTsBurned(_nftContract, _tokenIds, msg.sender, tokenReceived);
 
     }    
-
-    function getEstimatedAmount(address _nftContract, uint256 _selectedNFTs, address _userWallet) public view returns (uint256 _estimation){
-        require(collectionInformation[_nftContract].available >= _selectedNFTs, "This burn would exccess the limit!");
+    /**
+     * @dev returns the estimated soul amount for harvesting one or multiple NFTs
+    */
+    function getEstimatedAmount(address _nftContract, uint256 _selectedNFTs, address _userWallet) public view returns (uint256[2] memory){
+        require(extCollectionInformation.getAvailable(_nftContract) >= _selectedNFTs, "This burn would exccess the limit!");
 
         uint256 initialAmount = token.balanceOf(address(this));
 
         // 0.01% / 1 days => 0,00000003858024691 %/s => 0,0000000001157 share/s * 1000000000000 => 1157 => 1157 * 1000000 (for decimals) = 1157000000
         // portion = time[s] * 1157000000 / 10000000
 
-        uint256 timeElapsed = block.timestamp - collectionInformation[_nftContract].lastBurned;
-        uint256 localPortion = collectionInformation[_nftContract].sharePerSecond * timeElapsed / 10000000;
+        uint256 timeElapsed = block.timestamp - extCollectionInformation.getLastBurned(_nftContract);
+        uint256 localPortion = (extCollectionInformation.getShare(_nftContract)  + baseSharePerSecond) * timeElapsed / 10000000;
 
 
         uint256 incentiveAmount;
@@ -167,10 +156,14 @@ contract Harvester is Ownable, Pausable, ReentrancyGuard {
         uint256 teamAmount;
         uint256 teamReceived;
         uint256 tokenReceived;
-        uint256 alreadyBurned = collectionInformation[_nftContract].alreadyBurned;
+        uint256 alreadyBurned = extCollectionInformation.getAlreadyBurned(_nftContract);
         uint256 dimishing = 90;  
+        uint256 bonus = 0;
 
-        if(IERC721(ogNFTAddress).balanceOf(_userWallet) > 0){localPortion = localPortion * distribution_bonus_OG / 100000;}
+        if(SoulStone.hasSoulStone(_userWallet)){
+            bonus =  SoulStone.getBonusValueHarvest(_userWallet);
+            localPortion = localPortion * (100 + bonus) / 100;
+        }
 
         for (uint256 i = 0; i < _selectedNFTs; i++) {
 
@@ -190,91 +183,59 @@ contract Harvester is Ownable, Pausable, ReentrancyGuard {
             alreadyBurned++;
         }
      
-        return tokenReceived;
-    }
- 
-    function addToWhitelist(address _nftContract) public onlyOwnerOrManager {
-        require(!collectionInformation[_nftContract].isWhitelisted, "NFT contract is already whitelisted");
-
-        collectionInformation[_nftContract].isWhitelisted = true;
-        collectionInformation[_nftContract].limit = 1000;
-        collectionInformation[_nftContract].available = collectionInformation[_nftContract].limit - collectionInformation[_nftContract].alreadyBurned;
-        collectionInformation[_nftContract].lastBurned = block.timestamp;
-        collectionInformation[_nftContract].sharePerSecond = 1157000000; // ~0.01% / day
-
-        whitelistedContracts.push(_nftContract);
-
-    }
-    function getWhitelist() public view returns (address[] memory _whitelistedContracts){
-       
-        return whitelistedContracts;
-    }   
-
-    function changeLimit(address _nftContract, uint256 _limit) public onlyOwnerOrManager {
-        require(collectionInformation[_nftContract].isWhitelisted, "NFT contract is not whitelisted");
-        require(_limit >= collectionInformation[_nftContract].alreadyBurned, "Limit would be less than NFTs alread been burned!");
-        
-        collectionInformation[_nftContract].limit = _limit;
+        return [tokenReceived, bonus];
     }
 
-    function changeShare(address _nftContract, uint256 _share) public onlyOwnerOrManager {
-        require(collectionInformation[_nftContract].isWhitelisted, "NFT contract is not whitelisted");
-        require(_share > 0, "Share cannot be zero!");
-        
-        collectionInformation[_nftContract].sharePerSecond = _share; // default = 1157000000 => ~0.01% / day
-        collectionInformation[_nftContract].lastBurned = block.timestamp; 
-    }
+    /**
+     * @dev changes the Limit for how many NFTs of one collection can be harvested
+    */
 
-    function removeFromWhitelist(address _nftContract) public onlyOwnerOrManager {
-        require(collectionInformation[_nftContract].isWhitelisted, "NFT contract is not whitelisted");
-        collectionInformation[_nftContract].isWhitelisted = false;
-
-        uint256 index;
-
-        for(uint256 i = 0; i < whitelistedContracts.length; i++){
-            if (_nftContract == whitelistedContracts[i]){
-                index = i;
-                break;
-            }
-        }
-
-        whitelistedContracts[index] = whitelistedContracts[whitelistedContracts.length - 1];
-        whitelistedContracts.pop();
-    }
-
+    /**
+     * @dev sets the address of the Vessel Contract
+    */
     function setVesselAddress(address _vesselAddress) public onlyOwner {
         vesselAddress = _vesselAddress;
     }
-    
+    /**
+     * @dev sets the team wallet (doesn't work with Safe!)
+    */    
     function setTeamAddress(address _teamAddress) public onlyOwner {
         teamAddress = _teamAddress;
     }  
-
+    /**
+     * @dev sets the address of the Soul Token contract
+    */
     function setTokenAddress(address _tokenAddress) public onlyOwner {
         token = IERC20(_tokenAddress);
     }
-
-    function setOGNFTAddress(address _ogNFTAddress) public onlyOwner {
-        ogNFTAddress = _ogNFTAddress;
+    /**
+     * @dev sets the address of the Soulstone NFT contract
+    */
+    function setSoulStoneAddress(address _soulStoneAddress) public onlyOwner {
+        soulStoneAddress = _soulStoneAddress;
+        SoulStone = ISoulStone(soulStoneAddress);
     }
-
-    function setOGBonus(uint256 _bonus_OG) public onlyOwner {
-        distribution_bonus_OG = _bonus_OG;
-    }
-
+    /**
+     * @dev sets the base share per seconds for promo purposes
+    */
+    function setBaseSharePerSecond(uint256 _baseSharePerSecond) public onlyOwner {
+        baseSharePerSecond = _baseSharePerSecond;
+    } 
+    /**
+     * @dev sets share the vessel gets
+    */
     function setIncentivePortion(uint256 _incentivePortion) public onlyOwner {
         distribution_Incentive = _incentivePortion;
-    } 
-
+    }
+    /**
+     * @dev sets the value of the manual incentive 
+    */    
     function setManualIncentivePortion(uint256 _manualIncentivePortion) public onlyOwner {
         distribution_manual_Incentive = _manualIncentivePortion;
     }
-
-    function sendRemainingTokens() public onlyOwner {
-        uint256 remainingTokens = token.balanceOf(address(this));
-        token.safeTransfer(msg.sender, remainingTokens);
-    }
-
+    /**
+     * @dev manually send incentives to the Vessel
+    */
     function sendTokenToGauge() public onlyOwner {
         uint256 remainingToken = token.balanceOf(address(this));
         require(remainingToken > 0, "Remaining amount must be greater than zero");
@@ -282,6 +243,14 @@ contract Harvester is Ownable, Pausable, ReentrancyGuard {
         uint256 tokenForManualIncentive = remainingToken * distribution_manual_Incentive / 100000;
         token.safeTransfer(vesselAddress, tokenForManualIncentive);
     }
+    /**
+     * @dev sends the remaining tokens to the sender
+    */
+    function sendRemainingTokens() public onlyOwner {
+        uint256 remainingTokens = token.balanceOf(address(this));
+        token.safeTransfer(msg.sender, remainingTokens);
+    }
+
 
     function transferOwnership(address _newOwner) public override onlyOwner {
         _transferOwnership(_newOwner);
@@ -300,10 +269,15 @@ contract Harvester is Ownable, Pausable, ReentrancyGuard {
         require(msg.sender == _owner || msg.sender == manager, "You are neither the owner nor the manager!");
         _;
     }    
-    
+    /**
+     * @dev changes the manager of the contract
+    */    
     function changeManager(address _newManager) public onlyOwner {
         manager = _newManager;
-    }    
+    }
+    /**
+     * @dev sets the value of the recycling fee
+    */    
     function setRecyclingFee(uint256 _newFee) public onlyOwner {
         recyclingFee = _newFee;
     }
